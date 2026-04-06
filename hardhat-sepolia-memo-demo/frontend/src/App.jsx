@@ -69,7 +69,13 @@ function App() {
     步骤7 本地 decode(event.memo, 密钥)
 
     V1 保留说明（注释保留，不删除）：
-    1) 发送曾使用: signer.sendTransaction({ to, value, data: encodedMemo })
+    1) 发送: 构造签名 和发起交易， signer.sendTransaction({ to, value, data: encodedMemo })
+        构造签名
+           补齐 nonce / gas / chainId / fee 等字段
+           用 signer 对交易签名（得到 rawTx）
+        广播到节点
+            调 RPC eth_sendRawTransaction(rawTx) 发给 Infura/节点
+            返回 sentTx（包含 hash）
     2) 读取曾使用: provider.getTransaction(txHash) -> tx.data -> decode(tx.data, key)
     3) 由于 EOA + data 在部分钱包被拒绝，发送改为合约 sendWithMemo
     4) 由于历史查询性能问题，读取改为 Subgraph GraphQL 聚合查询
