@@ -1,0 +1,25 @@
+specVersion: 1.3.0
+indexerHints:
+  prune: auto
+schema:
+  file: ./schema.graphql
+dataSources:
+  - kind: ethereum
+    name: MemoStorage
+    network: sepolia
+    source:
+      address: "0x7013447906627eb1d7ae781bf7e8aa4b2567fe44"
+      abi: MemoStorage
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - MemoRecord
+      abis:
+        - name: MemoStorage
+          file: ./abis/MemoStorage.json
+      eventHandlers:
+        - event: MemoStored(indexed address,indexed address,uint256,string,uint256)
+          handler: handleMemoStored
+      file: ./src/mapping.ts
