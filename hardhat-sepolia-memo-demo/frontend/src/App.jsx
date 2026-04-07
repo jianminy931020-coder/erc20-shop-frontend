@@ -51,6 +51,11 @@ function formatSendError(err) {
   return err?.message ?? "发送失败";
 }
 
+const USDT_APPROVE_ABI = [
+  // 最小 ABI：只声明 approve，避免引入完整 ERC20 ABI。
+  "function approve(address spender, uint256 amount) external returns (bool)",
+];
+
 function App() {
   /*
     provider / signer 分工：
@@ -94,6 +99,8 @@ function App() {
   } = useWallet();
 
   const [activeTab, setActiveTab] = useState("send");
+  // 新增：发送资产模式切换（ETH / USDT）。
+  const [sendAssetMode, setSendAssetMode] = useState("eth");
 
   // 发送页输入状态：用户填写的业务参数。
   const [sendForm, setSendForm] = useState({
@@ -103,6 +110,15 @@ function App() {
   });
   // 发送流程状态：loading / 文案 / txHash。
   const [sendState, setSendState] = useState({ loading: false, message: "", txHash: "" });
+  // 新增：USDT 发送流程状态，和 ETH 状态隔离，避免互相覆盖。
+  const [usdtSendState, setUsdtSendState] = useState({ loading: false, message: "", txHash: "" });
+  // 新增：USDT 表单数据，和 ETH 表单隔离。
+  const [usdtSendForm, setUsdtSendForm] = useState({
+    to: "",
+    // 默认 1 USDT。
+    amount: "1",
+    memoText: "备注",
+  });
 
   // 查询页输入状态：按地址查询（不是 txHash）。
   const [queryAddress, setQueryAddress] = useState("");
@@ -111,6 +127,8 @@ function App() {
   const memoStorageAddress = import.meta.env.VITE_MEMO_STORAGE_ADDRESS;
   const memoKey = import.meta.env.VITE_MEMO_KEY;
   const subgraphUrl = import.meta.env.VITE_SUBGRAPH_URL;
+  // 新增：USDT 合约地址（从前端环境变量读取）。
+  const usdtAddress = import.meta.env.VITE_USDT_ADDRESS;
 
   // 直接复用 Hardhat 产物里的 ABI，不手抄接口。
   const memoStorageAbi = memoStorageArtifact.abi;
@@ -175,6 +193,12 @@ function App() {
   const handleSendInputChange = (event) => {
     const { name, value } = event.target;
     setSendForm((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleUsdtSendInputChange = (event) => {
+    // 新增：更新 USDT 表单字段。
+    const { name, value } = event.target;
+    setUsdtSendForm((prev) => ({ ...prev, [name]: value }));
   };
 
   // 合约版发送：contract.sendWithMemo(to, memo, { value })
@@ -261,6 +285,119 @@ function App() {
     }
   };
 
+  const handleSendUsdt = async (event) => {
+    // 阻止表单默认刷新。
+    event.preventDefault();
+
+    // 必须先连接 MetaMask。
+    if (!signer) {
+      setUsdtSendState({ loading: false, message: "请先连接 MetaMask 钱包", txHash: "" });
+      return;
+    }
+
+    // MemoStorage 合约地址校验。
+    if (!memoStorageAddress || !ethers.isAddress(memoStorageAddress)) {
+      setUsdtSendState({
+        loading: false,
+        message: "缺少 VITE_MEMO_STORAGE_ADDRESS 或地址格式错误",
+        txHash: "",
+      });
+      return;
+    }
+
+    // USDT 合约地址校验。
+    if (!usdtAddress || !ethers.isAddress(usdtAddress)) {
+      setUsdtSendState({
+        loading: false,
+        message: "缺少 VITE_USDT_ADDRESS 或地址格式错误",
+        txHash: "",
+      });
+      return;
+    }
+
+    try {
+      // 仅允许在 Sepolia 执行，避免误发主网。
+      const network = await signer.provider.getNetwork();
+      if (network.chainId !== SEPOLIA_CHAIN_ID) {
+        throw new Error("请先把 MetaMask 网络切换到 Sepolia");
+      }
+
+      // 收款地址格式校验。
+      if (!ethers.isAddress(usdtSendForm.to)) {
+        throw new Error("收款地址格式不正确");
+      }
+
+      // 备注密钥校验（encode 需要）。
+      if (!memoKey) {
+        throw new Error("缺少 VITE_MEMO_KEY，请在 frontend/.env.local 配置后重试");
+      }
+
+      // USDT 使用 6 位精度：例如 1.5 -> 1500000。
+      const parsedAmount = ethers.parseUnits(usdtSendForm.amount, 6);
+      // 备注按现有逻辑先 encode，再上链。
+      const encodedMemo = encode(usdtSendForm.memoText, memoKey);
+
+      // 第 1 步：先授权 MemoStorage 可扣这笔 USDT。
+      setUsdtSendState({
+        loading: true,
+        message: "步骤1/2：授权 USDT，请在 MetaMask 确认...",
+        txHash: "",
+      });
+
+      // 构造 USDT 合约实例（仅 approve 能力）。
+      const usdtContract = new ethers.Contract(usdtAddress, USDT_APPROVE_ABI, signer);
+      // 发送授权交易。发送一笔交易到 USDT 合约，设置授权额度给 memoStorageAddress
+      const approveTx = await usdtContract.approve(memoStorageAddress, parsedAmount);
+      // 等待授权交易确认。
+      await approveTx.wait();
+
+      // 第 2 步：调用 MemoStorage 的 sendUSDTWithMemo 执行转账并写备注事件。
+      setUsdtSendState({
+        loading: true,
+        message: "步骤2/2：发送备注交易，请在 MetaMask 确认...",
+        txHash: "",
+      });
+
+      // 构造 MemoStorage 合约实例。
+      const contract = new ethers.Contract(memoStorageAddress, memoStorageAbi, signer);
+      // 发起 USDT + memo 交易（链上会 emit MemoStored）。
+      const sendTx = await contract.sendUSDTWithMemo(
+        //u合约地址
+        usdtAddress,
+        //收款人
+        usdtSendForm.to,
+        //金额
+        parsedAmount,
+        //备注
+        encodedMemo
+      );
+
+      // 广播后先展示 txHash。
+      setUsdtSendState({
+        loading: true,
+        message: "USDT 备注交易已广播，等待链上确认...",
+        txHash: sendTx.hash,
+      });
+
+      // 等待交易确认。
+      const receipt = await sendTx.wait();
+      // 刷新钱包 ETH 余额（gas 消耗会变化）。
+      await refreshBalance();
+      // 刷新历史记录列表（subgraph 索引可能有延迟）。
+      refetchHistory().catch(() => {});
+
+      // 根据回执状态反馈最终结果。
+      setUsdtSendState({
+        loading: false,
+        message:
+          receipt?.status === 1 ? "USDT 备注交易确认成功（可稍后在历史列表查看）" : "交易已上链但状态失败",
+        txHash: sendTx.hash,
+      });
+    } catch (err) {
+      setUsdtSendState({ loading: false, message: formatSendError(err), txHash: "" });
+    }
+  };
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -308,47 +445,117 @@ function App() {
       {activeTab === "send" ? (
         <section className="panel">
           <h2>步骤2：填写参数并提交合约交易</h2>
-          <form className="form-grid" onSubmit={handleSend}>
-            <label>
-              收款地址
-              <input name="to" value={sendForm.to} onChange={handleSendInputChange} required />
-            </label>
-
-            <label>
-              金额 (ETH)
-              <input
-                name="amount"
-                value={sendForm.amount}
-                onChange={handleSendInputChange}
-                type="number"
-                min="0"
-                step="0.0001"
-                required
-              />
-            </label>
-
-            <label>
-              备注文字
-              <textarea
-                name="memoText"
-                value={sendForm.memoText}
-                onChange={handleSendInputChange}
-                rows={3}
-                required
-              />
-            </label>
-
-            <button className="btn primary" type="submit" disabled={sendState.loading}>
-              {sendState.loading ? "处理中..." : "提交并签名"}
+          <div className="tabs" style={{ marginTop: "0.8rem" }}>
+            <button
+              className={sendAssetMode === "eth" ? "tab active" : "tab"}
+              // 切换到 ETH 发送表单。
+              onClick={() => setSendAssetMode("eth")}
+              type="button"
+            >
+              ETH 转账
             </button>
-          </form>
+            <button
+              className={sendAssetMode === "usdt" ? "tab active" : "tab"}
+              // 切换到 USDT 发送表单。
+              onClick={() => setSendAssetMode("usdt")}
+              type="button"
+            >
+              USDT 转账
+            </button>
+          </div>
 
-          {sendState.message ? <p className="status">{sendState.message}</p> : null}
-          {sendState.txHash ? (
-            <p className="hash">
-              txHash: <code>{sendState.txHash}</code>
-            </p>
-          ) : null}
+          {sendAssetMode === "eth" ? (
+            <>
+              {/* ETH 模式：完全沿用原有发送逻辑 */}
+              <form className="form-grid" onSubmit={handleSend}>
+                <label>
+                  收款地址
+                  <input name="to" value={sendForm.to} onChange={handleSendInputChange} required />
+                </label>
+
+                <label>
+                  金额 (ETH)
+                  <input
+                    name="amount"
+                    value={sendForm.amount}
+                    onChange={handleSendInputChange}
+                    type="number"
+                    min="0"
+                    step="0.0001"
+                    required
+                  />
+                </label>
+
+                <label>
+                  备注文字
+                  <textarea
+                    name="memoText"
+                    value={sendForm.memoText}
+                    onChange={handleSendInputChange}
+                    rows={3}
+                    required
+                  />
+                </label>
+
+                <button className="btn primary" type="submit" disabled={sendState.loading}>
+                  {sendState.loading ? "处理中..." : "提交并签名"}
+                </button>
+              </form>
+
+              {sendState.message ? <p className="status">{sendState.message}</p> : null}
+              {sendState.txHash ? (
+                <p className="hash">
+                  txHash: <code>{sendState.txHash}</code>
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <>
+              {/* USDT 模式：两笔交易（approve -> sendUSDTWithMemo） */}
+              <form className="form-grid" onSubmit={handleSendUsdt}>
+                <label>
+                  收款地址
+                  <input name="to" value={usdtSendForm.to} onChange={handleUsdtSendInputChange} required />
+                </label>
+
+                <label>
+                  金额 (USDT)
+                  <input
+                    name="amount"
+                    value={usdtSendForm.amount}
+                    onChange={handleUsdtSendInputChange}
+                    type="number"
+                    min="0"
+                    // 6 位小数精度输入步长（匹配 parseUnits(..., 6)）。
+                    step="0.000001"
+                    required
+                  />
+                </label>
+
+                <label>
+                  备注文字
+                  <textarea
+                    name="memoText"
+                    value={usdtSendForm.memoText}
+                    onChange={handleUsdtSendInputChange}
+                    rows={3}
+                    required
+                  />
+                </label>
+
+                <button className="btn primary" type="submit" disabled={usdtSendState.loading}>
+                  {usdtSendState.loading ? "处理中..." : "提交并签名"}
+                </button>
+              </form>
+
+              {usdtSendState.message ? <p className="status">{usdtSendState.message}</p> : null}
+              {usdtSendState.txHash ? (
+                <p className="hash">
+                  txHash: <code>{usdtSendState.txHash}</code>
+                </p>
+              ) : null}
+            </>
+          )}
         </section>
       ) : (
         <section className="panel">
